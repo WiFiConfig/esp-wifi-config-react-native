@@ -16,6 +16,11 @@ export type BleErrorCode =
    * first. Pass `''` for a Security 1 device that runs without a PoP.
    */
   | 'missing_credentials'
+  | 'bluetooth_unauthorized'
+  | 'session_init_failed'
+  | 'security_mismatch'
+  | 'connect_timeout'
+  | 'operation_cancelled'
   | 'powered_off'
   | 'unsupported'
   | 'scan_error'
@@ -108,6 +113,8 @@ export interface BleTransportConfig {
   deviceNamePrefix?: string | string[];
   /** Scan timeout in ms. Default: 10000. */
   scanTimeoutMs?: number;
+  /** Entire discovery + handshake timeout in ms. Default: 20000. */
+  connectTimeoutMs?: number;
   /**
    * Security version used during the protocomm session.
    * Default: 1 (matches the firmware's default).

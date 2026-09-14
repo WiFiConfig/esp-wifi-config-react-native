@@ -12,6 +12,7 @@
 import { useCallback, useState } from 'react';
 
 import { useProvisioningStore } from '../store/provisioningStore';
+import { OperationCancelledError } from '../utils/operations';
 import type { DeviceVariable } from '../types';
 
 /**
@@ -37,7 +38,9 @@ export function useDeviceVariables() {
     try {
       return await listVarsCmd();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (!(err instanceof OperationCancelledError)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
       return null;
     } finally {
       setInFlight((c) => c - 1);
@@ -51,7 +54,9 @@ export function useDeviceVariables() {
       try {
         return await getVarCmd(key);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        if (!(err instanceof OperationCancelledError)) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
         return null;
       } finally {
         setInFlight((c) => c - 1);
@@ -68,7 +73,9 @@ export function useDeviceVariables() {
         await setVarCmd(key, value);
         return true;
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        if (!(err instanceof OperationCancelledError)) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
         return false;
       } finally {
         setInFlight((c) => c - 1);
@@ -85,7 +92,9 @@ export function useDeviceVariables() {
         await delVarCmd(key);
         return true;
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        if (!(err instanceof OperationCancelledError)) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
         return false;
       } finally {
         setInFlight((c) => c - 1);

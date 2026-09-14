@@ -17,6 +17,7 @@
  * stream, that is just what the underlying SDK supports.
  */
 
+import * as NativeProvisioning from '@orbital-systems/react-native-esp-idf-provisioning';
 import {
   ESPDevice,
   ESPProvisionManager,
@@ -28,7 +29,6 @@ import type {
   BleConnectionState,
   ConnectedDeviceInfo,
   DeviceAuthCredentials,
-  DiscoveredDevice,
   BleTransportEvents,
   BleTransportConfig,
   SecurityVersion,
@@ -43,12 +43,14 @@ import {
 } from '../constants/ble';
 
 import { TypedEventEmitter, createLogger } from '../utils';
+import { OperationCancelledError, OperationTimeoutError, waitForOperation } from '../utils/operations';
 
 const log = createLogger('BleTransport');
 
 interface ResolvedConfig {
   deviceNamePrefixes: string[];
   scanTimeoutMs: number;
+  connectTimeoutMs: number;
   security: SecurityVersion;
   /**
    * No default. `undefined` = not configured (wizard prompts; headless
@@ -69,6 +71,7 @@ function resolveConfig(config?: BleTransportConfig): ResolvedConfig {
   return {
     deviceNamePrefixes: normalizePrefixes(config?.deviceNamePrefix),
     scanTimeoutMs: config?.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS,
+    connectTimeoutMs: config?.connectTimeoutMs ?? 20000,
     security: config?.security ?? 1,
     proofOfPossession: config?.proofOfPossession,
     username: config?.username ?? DEFAULT_SECURITY2_USERNAME,
@@ -88,13 +91,51 @@ function toEspSecurity(s: SecurityVersion): ESPSecurity {
   }
 }
 
+function nativeErrorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+    ? error.code : undefined;
+}
+
+function mapBleError(error: unknown, fallback: 'scan_error' | 'connect_error'): BleLibraryError {
+  const message = error instanceof Error ? error.message : String(error);
+  const nativeCode = nativeErrorCode(error);
+  const codes = {
+    bluetooth_unauthorized: 'bluetooth_unauthorized',
+    bluetooth_powered_off: 'powered_off',
+    bluetooth_unavailable: 'unsupported',
+    connect_timeout: 'connect_timeout',
+    session_init_failed: 'session_init_failed',
+    security_mismatch: 'security_mismatch',
+    missing_pop: 'missing_credentials',
+    missing_username: 'missing_credentials',
+  } as const;
+  if (nativeCode && nativeCode in codes) {
+    return new BleLibraryError(codes[nativeCode as keyof typeof codes], message);
+  }
+  if (error instanceof OperationTimeoutError) return new BleLibraryError(fallback === 'connect_error' ? 'connect_timeout' : fallback, message);
+  // Only older bridges need text fallback. A generic session-init failure is
+  // not evidence of incorrect credentials; retain it as a connection error.
+  if (/powered[\s_-]*off|\b(?:bluetooth|radio)\b.{0,40}\b(?:off|disabled)\b/i.test(message)) {
+    return new BleLibraryError('powered_off', message);
+  }
+  if (/\bpermission\b.{0,60}\b(?:denied|missing|required)\b|\b(?:missing|denied|required)\b.{0,60}\bpermissions?\b/i.test(message)) {
+    return new BleLibraryError('bluetooth_unauthorized', message);
+  }
+  if (/unauth/i.test(message)) return new BleLibraryError(fallback === 'scan_error' ? 'bluetooth_unauthorized' : 'unauthorized', message);
+  if (/bad pop|invalid (?:pop|proof|password|credential)/i.test(message)) return new BleLibraryError('unauthorized', message);
+  return new BleLibraryError(fallback, message);
+}
+
 export class BleTransport extends TypedEventEmitter<BleTransportEvents> {
   private readonly config: ResolvedConfig;
 
   private _connectionState: BleConnectionState = 'disconnected';
   private _device: ESPDevice | null = null;
   private _connectedDeviceInfo: ConnectedDeviceInfo | null = null;
-  private scanTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  private scanController: AbortController | null = null;
+  private connectController: AbortController | null = null;
+  private pendingDevice: ESPDevice | null = null;
+  private unsubscribeDisconnect: (() => void) | undefined;
   private _destroyed = false;
 
   // ────────────────────────────────────────────────────────────────────
@@ -104,6 +145,22 @@ export class BleTransport extends TypedEventEmitter<BleTransportEvents> {
   constructor(config?: BleTransportConfig) {
     super();
     this.config = resolveConfig(config);
+    // Compatible with older SDK wrappers; the local native integration adds
+    // this listener without making Android emit an unidentified global event.
+    const native = NativeProvisioning as typeof NativeProvisioning & {
+      addDeviceDisconnectListener?: (
+        listener: (event: { deviceName: string; reason?: string }) => void,
+      ) => () => void;
+    };
+    this.unsubscribeDisconnect = native.addDeviceDisconnectListener?.((event) => {
+      if (this._device?.name !== event.deviceName && this.pendingDevice?.name !== event.deviceName) return;
+      this.connectController?.abort();
+      this.connectController = null;
+      this.pendingDevice = null;
+      this._device = null;
+      this._connectedDeviceInfo = null;
+      this.setConnectionState('disconnected');
+    });
     log.info('BleTransport created', {
       prefixes: this.config.deviceNamePrefixes,
       security: this.config.security,
@@ -152,124 +209,81 @@ export class BleTransport extends TypedEventEmitter<BleTransportEvents> {
    * resolves, every matched device is emitted as a separate
    * `deviceDiscovered` event followed by a single `scanCompleted`.
    *
-   * The scan is implicitly bounded by `scanTimeoutMs`; we race the SDK
-   * call against a setTimeout that calls `stopScan()` if the SDK doesn't
-   * return on its own.
+   * The scan settles within `scanTimeoutMs` even if native never calls back.
+   * Cancellation invalidates the scan before native cleanup so late results
+   * cannot publish discoveries into a replacement session.
    */
   async startScan(): Promise<void> {
-    if (this._connectionState === 'scanning') {
-      log.warn('Scan already in progress');
-      return;
-    }
-    if (
-      this._connectionState === 'connected' ||
-      this._connectionState === 'connecting'
-    ) {
-      log.warn('Cannot scan while connected or connecting');
-      return;
-    }
-
-    log.info('Starting BLE scan', { prefixes: this.config.deviceNamePrefixes });
+    if (this._destroyed || this._connectionState !== 'disconnected') return;
+    const operation = new AbortController();
+    this.scanController = operation;
     this.setConnectionState('scanning');
-
-    // Schedule a hard cap so the UI never hangs on a stuck scan.
-    this.scanTimeoutId = setTimeout(() => {
-      log.warn(`Scan timeout after ${this.config.scanTimeoutMs}ms — cancelling`);
-      try {
-        ESPProvisionManager.stopESPDevicesSearch();
-      } catch {
-        // SDK may have already finished.
-      }
-    }, this.config.scanTimeoutMs);
-
-    const matched = new Map<string, ESPDevice>();
-    let scanError: BleLibraryError | null = null;
-
-    // Run a SINGLE match-all scan and filter by prefix in JS, rather than one
-    // searchESPDevices() call per prefix. Two reasons the per-prefix approach
-    // is broken: (1) each call runs a full (~5s) BLE scan with a fixed SDK
-    // timer, so N prefixes take N×5s and our hard-cap timeout fires *during* a
-    // later prefix's scan, force-stopping it into a false "not found"; (2) it
-    // scans the air N times for no reason. An empty prefix matches every named
-    // device (the SDK does `name.hasPrefix("")` → always true), so one scan
-    // surfaces everything; we then keep only devices matching a configured
-    // prefix. The SDK still *rejects* when it finds no named device at all —
-    // that's a benign empty result, not a failure, unless it's actionable
-    // (Bluetooth off / unauthorized).
     try {
-      const devices = await ESPProvisionManager.searchESPDevices(
+      const nativeScan = ESPProvisionManager.searchESPDevices(
         '',
         ESPTransport.ble,
         toEspSecurity(this.config.security),
+      ).then(
+        (devices) => {
+          // Discovery diagnostics intentionally exclude device names and data.
+          log.debug('Native BLE scan result', { count: devices.length });
+          return devices;
+        },
+        (error: unknown) => {
+          log.debug('Native BLE scan rejected', {
+            code: nativeErrorCode(error) ?? null,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        },
       );
-      for (const d of devices) {
-        if (this.matchesAnyPrefix(d.name) && !matched.has(d.name)) {
-          matched.set(d.name, d);
-        }
+      const devices = await waitForOperation(
+        nativeScan,
+        operation.signal,
+        this.config.scanTimeoutMs,
+        'BLE scan',
+      );
+      if (this.scanController !== operation || operation.signal.aborted) return;
+      const matched = new Map<string, ESPDevice>();
+      for (const device of devices) {
+        if (this.matchesAnyPrefix(device.name)) matched.set(device.name, device);
       }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (/unauth/i.test(message)) {
-        scanError = new BleLibraryError('unauthorized', `BLE scan error: ${message}`);
-      } else if (/off|disabled/i.test(message)) {
-        scanError = new BleLibraryError('powered_off', `BLE scan error: ${message}`);
-      } else {
-        // Almost always "no device found" — a benign empty result, not a
-        // failure. Reported below via scanCompleted (matched: 0).
-        log.debug(`Scan matched no devices: ${message}`);
+      for (const device of matched.values()) {
+        this.emit('deviceDiscovered', { id: device.name, name: device.name, rssi: null });
+      }
+      this.emit('scanCompleted', { matched: matched.size, total: matched.size, sampleNames: [] });
+    } catch (error) {
+      if (this.scanController !== operation || operation.signal.aborted) return;
+      const message = error instanceof Error ? error.message : String(error);
+      const code = nativeErrorCode(error);
+      const mappedError = mapBleError(error, 'scan_error');
+      // A generic SDK failure may mention both an unavailable radio/permission
+      // and an empty scan. Preserve the actionable diagnosis before applying
+      // the compatibility fallback for older SDKs' benign no-device errors.
+      if (mappedError.code === 'scan_error' && (!code || code === 'error' || code === 'scan_failed') && /no.*device.*found|device.*not.*found/i.test(message)) {
+        this.emit('scanCompleted', { matched: 0, total: 0, sampleNames: [] });
+      } else if (code !== 'scan_cancelled' && code !== 'operation_cancelled') {
+        this.emit('error', mappedError);
+      }
+      if (error instanceof OperationTimeoutError) this.stopNativeScan();
+    } finally {
+      if (this.scanController === operation) {
+        this.scanController = null;
+        this.setConnectionState('disconnected');
+        this.emit('scanStopped');
       }
     }
-
-    this.clearScanTimeout();
-    if (this._destroyed) return;
-
-    // Surface a hard error only when nothing matched AND the scan failed for an
-    // actionable reason. "No devices found" is reported via scanCompleted
-    // (matched: 0), never the error event — see CLAUDE.md.
-    if (matched.size === 0 && scanError) {
-      log.error('Scan failed:', scanError.message);
-      this.emit('error', scanError);
-      this.setConnectionState('disconnected');
-      this.emit('scanStopped');
-      return;
-    }
-
-    for (const device of matched.values()) {
-      const discovered: DiscoveredDevice = {
-        id: device.name, // SDK uses name as the connection key on iOS
-        name: device.name,
-        rssi: null, // not surfaced by the SDK
-      };
-      this.emit('deviceDiscovered', discovered);
-    }
-
-    this.emit('scanCompleted', {
-      matched: matched.size,
-      total: matched.size,
-      sampleNames: [],
-    });
-
-    this.setConnectionState('disconnected');
-    this.emit('scanStopped');
-    log.info(`Scan completed: ${matched.size} matched device(s)`);
   }
 
-  /**
-   * Cancel an in-flight scan. Safe to call when no scan is running.
-   */
+  /** Cancel immediately; stale SDK results never update a subsequent scan. */
   stopScan(): void {
-    if (this._connectionState !== 'scanning') {
-      return;
-    }
-    log.info('Stop scan requested');
-    this.clearScanTimeout();
-    try {
-      ESPProvisionManager.stopESPDevicesSearch();
-    } catch {
-      // SDK may have already finished.
-    }
-    // The startScan() promise will resolve naturally once the SDK returns;
-    // it will emit scanStopped and reset state then.
+    if (!this.scanController) return;
+    const operation = this.scanController;
+    this.scanController = null;
+    operation.abort();
+    this.stopNativeScan();
+    if (this._connectionState === 'scanning') this.setConnectionState('disconnected');
+    this.emit('scanStopped');
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -293,76 +307,45 @@ export class BleTransport extends TypedEventEmitter<BleTransportEvents> {
     deviceId: string,
     overrides?: DeviceAuthCredentials,
   ): Promise<ConnectedDeviceInfo> {
-    log.info('Connecting to device:', deviceId);
-
-    // Stop any active scan before connecting.
-    if (this._connectionState === 'scanning') {
-      this.stopScan();
-    }
-
+    if (this._destroyed) throw new OperationCancelledError();
+    // Cancel an older scan/connection before giving native code another owner.
+    void this.disconnect();
     const pop = overrides?.pop ?? this.config.proofOfPossession;
-    const username =
-      this.config.security === 2
-        ? overrides?.username ?? this.config.username
-        : null;
-
-    // Nothing configured and nothing supplied. The wizard never gets here —
-    // ProvisioningManager inserts `enterDeviceAuth` first — so this is for
-    // headless callers, who must say what they mean: a PoP, or `''` for a
-    // device that runs Security 1 without one. Refusing up front beats
-    // letting the native SDK fail the handshake with a generic message.
+    const username = this.config.security === 2 ? overrides?.username ?? this.config.username : null;
     if (this.config.security !== 0 && pop === undefined) {
-      this.setConnectionState('disconnected');
-      throw new BleLibraryError(
-        'missing_credentials',
-        this.config.security === 1
-          ? "Security 1 needs a proof-of-possession: set ble.proofOfPossession " +
-            "(use '' for a device configured with no PoP) or pass { pop } to connect()"
-          : 'Security 2 needs an SRP password: set ble.proofOfPossession or pass { pop } to connect()',
-      );
+      throw new BleLibraryError('missing_credentials', 'Device authentication is required. Configure a proof-of-possession, or use an empty string for Security 1 without PoP.');
     }
-
+    const operation = new AbortController();
+    const device = new ESPDevice({ name: deviceId, transport: ESPTransport.ble, security: toEspSecurity(this.config.security) });
+    this.connectController = operation;
+    this.pendingDevice = device;
     this.setConnectionState('connecting');
-
-    const device = new ESPDevice({
-      name: deviceId,
-      transport: ESPTransport.ble,
-      security: toEspSecurity(this.config.security),
-    });
-
     try {
-      // Security 0 has no PoP; `''` (no-PoP Security 1) goes through as-is —
-      // both the firmware and the native SDKs skip the PoP mixing step for an
-      // empty value, and the iOS SDK additionally honours the device's
-      // advertised `no_pop` capability.
-      await device.connect(pop ?? null, null, username);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      log.error('Connect failed:', message);
-      this._device = null;
-      this._connectedDeviceInfo = null;
-      this.setConnectionState('disconnected');
-      // Heuristic — the native SDK surfaces a variety of strings for
-      // failed handshakes; anything that looks like an auth/PoP/SRP
-      // failure is treated as 'unauthorized' so the manager can bounce
-      // back to the auth step instead of cancelling the whole flow.
-      const code: 'unauthorized' | 'connect_error' = /unauth|pop|proof|verifier|invalid (?:password|credential)/i.test(
-        message,
-      )
-        ? 'unauthorized'
-        : 'connect_error';
-      throw new BleLibraryError(code, `BLE connect error: ${message}`);
+      await waitForOperation(
+        device.connect(pop ?? null, null, username),
+        operation.signal,
+        this.config.connectTimeoutMs,
+        'BLE connection',
+      );
+      if (this.connectController !== operation || operation.signal.aborted) throw new OperationCancelledError();
+      this.pendingDevice = null;
+      this.connectController = null;
+      this._device = device;
+      this._connectedDeviceInfo = { id: deviceId, name: deviceId, mtu: null };
+      this.setConnectionState('connected');
+      return this._connectedDeviceInfo;
+    } catch (error) {
+      if (this.connectController === operation) {
+        this.connectController = null;
+        this.pendingDevice = null;
+        operation.abort();
+        this.stopNativeScan();
+        this.disconnectNative(device);
+        this.setConnectionState('disconnected');
+      }
+      if (error instanceof OperationCancelledError) throw error;
+      throw mapBleError(error, 'connect_error');
     }
-
-    this._device = device;
-    this._connectedDeviceInfo = {
-      id: deviceId,
-      name: deviceId,
-      mtu: null, // not surfaced by the SDK
-    };
-    this.setConnectionState('connected');
-    log.info('Connected successfully', this._connectedDeviceInfo);
-    return this._connectedDeviceInfo;
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -370,45 +353,28 @@ export class BleTransport extends TypedEventEmitter<BleTransportEvents> {
   // ────────────────────────────────────────────────────────────────────
 
   async disconnect(): Promise<void> {
-    log.info('Disconnect requested');
-    if (this._device) {
-      try {
-        this._device.disconnect();
-      } catch (err) {
-        log.debug('Ignoring disconnect error:', err);
-      }
+    this.stopScan();
+    const pending = this.pendingDevice;
+    this.pendingDevice = null;
+    this.connectController?.abort();
+    this.connectController = null;
+    if (pending) {
+      this.stopNativeScan();
+      this.disconnectNative(pending);
     }
+    const device = this._device;
     this._device = null;
     this._connectedDeviceInfo = null;
+    if (device && device !== pending) this.disconnectNative(device);
     this.setConnectionState('disconnected');
   }
-
-  // ────────────────────────────────────────────────────────────────────
-  // Lifecycle
-  // ────────────────────────────────────────────────────────────────────
 
   async destroy(): Promise<void> {
     if (this._destroyed) return;
     this._destroyed = true;
-    log.info('Destroying transport');
-
-    this.clearScanTimeout();
-    try {
-      ESPProvisionManager.stopESPDevicesSearch();
-    } catch {
-      /* ignore */
-    }
-
-    if (this._device) {
-      try {
-        this._device.disconnect();
-      } catch {
-        /* ignore */
-      }
-    }
-    this._device = null;
-    this._connectedDeviceInfo = null;
-    this._connectionState = 'disconnected';
+    this.unsubscribeDisconnect?.();
+    this.unsubscribeDisconnect = undefined;
+    await this.disconnect();
     this.removeAllListeners();
   }
 
@@ -434,10 +400,11 @@ export class BleTransport extends TypedEventEmitter<BleTransportEvents> {
     this.emit('connectionStateChanged', state);
   }
 
-  private clearScanTimeout(): void {
-    if (this.scanTimeoutId !== null) {
-      clearTimeout(this.scanTimeoutId);
-      this.scanTimeoutId = null;
-    }
+  private stopNativeScan(): void {
+    try { ESPProvisionManager.stopESPDevicesSearch(); } catch { /* best effort */ }
+  }
+
+  private disconnectNative(device: ESPDevice): void {
+    try { device.disconnect(); } catch { /* best effort */ }
   }
 }
