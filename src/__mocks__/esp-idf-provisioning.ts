@@ -41,9 +41,11 @@ export interface ESPStatusResponse {
 }
 
 interface MockHooks {
-  search?: (prefix: string) => ESPDevice[];
+  disconnect?: (name: string) => void;
+  stopSearch?: () => void;
+  search?: (prefix: string) => ESPDevice[] | Promise<ESPDevice[]>;
   connect?: (name: string, pop: string | null) => void | Promise<void>;
-  scanWifi?: () => ESPWifiList[];
+  scanWifi?: () => ESPWifiList[] | Promise<ESPWifiList[]>;
   provision?: (ssid: string, password: string) => ESPStatusResponse | Promise<ESPStatusResponse>;
   sendData?: (path: string, data: string) => string | Promise<string>;
 }
@@ -94,6 +96,7 @@ export class ESPDevice {
   }
 
   disconnect(): void {
+    mockHooks.disconnect?.(this.name);
     this.connected = false;
   }
 
@@ -152,8 +155,19 @@ export class ESPProvisionManager {
     return mockHooks.search ? mockHooks.search(prefix) : [];
   }
   static stopESPDevicesSearch(): void {
-    /* no-op */
+    mockHooks.stopSearch?.();
   }
 }
 
 export type ESPDeviceInterface = ESPDevice;
+
+const disconnectListeners = new Set<(event: { deviceName: string; reason?: string }) => void>();
+
+export function addDeviceDisconnectListener(listener: (event: { deviceName: string; reason?: string }) => void): () => void {
+  disconnectListeners.add(listener);
+  return () => { disconnectListeners.delete(listener); };
+}
+
+export function emitMockDeviceDisconnect(deviceName: string): void {
+  for (const listener of disconnectListeners) listener({ deviceName });
+}

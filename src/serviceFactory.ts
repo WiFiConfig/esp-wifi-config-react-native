@@ -54,9 +54,13 @@ export async function destroyServices(): Promise<void> {
   protocol = null;
   transport = null;
 
-  if (prevManager) await prevManager.destroy();
-  if (prevProtocol) prevProtocol.destroy();
-  if (prevTransport) await prevTransport.destroy();
+  // Invalidate every old layer synchronously before yielding. React may mount
+  // another wizard while cleanup settles; old native cleanup must not stop
+  // that newly initialized session.
+  const managerCleanup = prevManager?.destroy();
+  prevProtocol?.destroy();
+  const transportCleanup = prevTransport?.destroy();
+  await Promise.all([managerCleanup, transportCleanup]);
 }
 
 export { initializeServices };

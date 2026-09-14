@@ -162,6 +162,8 @@ export interface ProvisioningResult {
 // ---------------------------------------------------------------------------
 
 export interface OnConnectedContext {
+  /** Aborted on cancel, device restart, or destroy. Stop pending custom UI work. */
+  signal: AbortSignal;
   /** Custom-endpoint protocol helper. */
   protocol: DeviceProtocol;
   /** Transport instance. Use only for low-level diagnostics. */
@@ -191,6 +193,8 @@ export interface ProvisioningConfig {
     autoConnectOpenNetworks?: boolean;
     /** Override the SDK provision()-call timeout (ms). Default: 60000. */
     provisionTimeoutMs?: number;
+    /** Total optional network-info budget after success (ms). Default: 3000. */
+    networkInfoTimeoutMs?: number;
   };
 }
 
@@ -231,6 +235,8 @@ export interface ProvisioningManagerEvents {
   selectedNetworkChanged: (network: ScannedNetwork | null) => void;
   deviceConnectionChanged: (device: DeviceConnection) => void;
   provisioningComplete: (result: ProvisioningResult) => void;
+  /** Optional details for the same successful run; never a second completion. */
+  provisioningResultUpdated: (result: ProvisioningResult) => void;
   provisioningReset: () => void;
   /** Forwarded SDK provision() result before manager transitions to success/error. */
   provisionResult: (result: ProvisionResult) => void;

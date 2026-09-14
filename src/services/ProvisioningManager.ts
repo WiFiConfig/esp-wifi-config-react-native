@@ -30,6 +30,7 @@ import { DISCONNECT_SETTLE_MS } from '../constants/provisioning';
 import { DEFAULT_PROVISION_TIMEOUT_MS } from '../constants/protocol';
 
 import { TypedEventEmitter, createLogger } from '../utils';
+import { OperationCancelledError, pause, waitForOperation } from '../utils/operations';
 
 import { BleLibraryError } from '../types/ble';
 import type { BleTransport } from './BleTransport';
@@ -45,6 +46,7 @@ interface ResolvedFlowConfig {
   onConnected: OnConnectedCallback | null;
   autoConnectOpenNetworks: boolean;
   provisionTimeoutMs: number;
+  networkInfoTimeoutMs: number;
 }
 
 interface ResolvedProvisioningConfig {
@@ -60,6 +62,7 @@ function resolveConfig(
       autoConnectOpenNetworks: config?.flow?.autoConnectOpenNetworks ?? true,
       provisionTimeoutMs:
         config?.flow?.provisionTimeoutMs ?? DEFAULT_PROVISION_TIMEOUT_MS,
+      networkInfoTimeoutMs: config?.flow?.networkInfoTimeoutMs ?? 3000,
     },
   };
 }
@@ -67,10 +70,6 @@ function resolveConfig(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -128,6 +127,8 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
   private _forceAuthPrompt = false;
 
   private unsubscribeFns: Array<() => void> = [];
+  private run = new AbortController();
+  private destroyed = false;
 
   constructor(
     transport: BleTransport,
@@ -173,8 +174,11 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
   }
 
   async chooseDevice(target: DiscoveredDevice): Promise<void> {
+    if (this.destroyed || this._step !== 'scanBle') return;
+    const run = this.beginRun();
     log.info('chooseDevice:', target.name, target.id);
     this.clearError();
+    this.setStep('connectingBle');
 
     this._device = {
       status: 'connecting',
@@ -186,7 +190,10 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
     this._pendingDevice = target;
 
     this.transport.stopScan();
-    await delay(DISCONNECT_SETTLE_MS);
+    try {
+      await pause(DISCONNECT_SETTLE_MS, run.signal);
+    } catch { return; }
+    if (!this.isCurrent(run)) return;
 
     if (this.shouldPromptForAuth()) {
       // Park on enterDeviceAuth and wait for submitDeviceAuth() to drive
@@ -272,6 +279,7 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
    * user can correct the credentials without re-scanning.
    */
   private async _connectAfterAuth(): Promise<void> {
+    const run = this.run;
     const target = this._pendingDevice;
     if (!target) {
       log.error('_connectAfterAuth with no pending device');
@@ -287,9 +295,12 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
         this._pendingAuth ?? undefined,
       );
     } catch (err) {
+      if (!this.isCurrent(run)) return;
       const code = err instanceof BleLibraryError ? err.code : undefined;
 
-      if (code === 'unauthorized' || code === 'missing_credentials') {
+      const { security, proofOfPossession } = this.transport.resolvedConfig;
+      const canCorrectCredentials = security !== 0 && (security === 2 || proofOfPossession !== '');
+      if (code === 'unauthorized' || code === 'missing_credentials' || (code === 'session_init_failed' && canCorrectCredentials)) {
         // Stay locked into the auth screen on subsequent chooseDevice
         // calls until the user successfully connects. `missing_credentials`
         // shouldn't happen here (shouldPromptForAuth gates it) but the
@@ -300,7 +311,9 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
         this.setError({
           source: 'ble',
           code,
-          message: toErrorMessage(err),
+          message: code === 'session_init_failed'
+            ? 'A secure session could not be established. Check the device code and reconnect.'
+            : toErrorMessage(err),
           recoverable: true,
         });
         this.setStep('enterDeviceAuth');
@@ -321,6 +334,8 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
       return;
     }
 
+    if (!this.isCurrent(run)) return;
+
     // Successful connect — clear the auth-retry latch and pending state.
     this._forceAuthPrompt = false;
     this._pendingDevice = null;
@@ -336,11 +351,13 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
 
     if (this.config.flow.onConnected) {
       try {
-        await this.config.flow.onConnected({
+        await waitForOperation(this.config.flow.onConnected({
           protocol: this.protocol,
           transport: this.transport,
-        });
+          signal: run.signal,
+        }), run.signal);
       } catch (err) {
+        if (!this.isCurrent(run)) return;
         this.setError({
           source: 'flow',
           message: toErrorMessage(err),
@@ -350,7 +367,7 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
       }
     }
 
-    await this.proceedFromConfigure();
+    if (this.isCurrent(run)) await this.proceedFromConfigure();
   }
 
   /**
@@ -388,7 +405,7 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
   }
 
   async rescanWifi(): Promise<void> {
-    if (this._step !== 'chooseNetwork' && this._step !== 'scanningWifi') {
+    if (this._step !== 'chooseNetwork') {
       log.warn('rescanWifi called from unsupported step:', this._step);
       return;
     }
@@ -398,6 +415,8 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
   }
 
   chooseNetwork(network: ScannedNetwork): void {
+    if (this.destroyed || this._step !== 'chooseNetwork') return;
+    this.clearError();
     log.info('chooseNetwork:', network.ssid);
     this._selectedNetwork = network;
     this.emit('selectedNetworkChanged', network);
@@ -405,6 +424,8 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
   }
 
   backToNetworks(): void {
+    if (this._step !== 'enterCredentials') return;
+    this.clearError();
     log.info('backToNetworks');
     this._selectedNetwork = null;
     this.emit('selectedNetworkChanged', null);
@@ -418,6 +439,9 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
    * network).
    */
   async submitPassword(password: string): Promise<void> {
+    if (this.destroyed || this._step !== 'enterCredentials') return;
+    const run = this.run;
+    const target = this._device;
     log.info('submitPassword for:', this._selectedNetwork?.ssid);
     this.clearError();
 
@@ -442,35 +466,41 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
         this.config.flow.provisionTimeoutMs,
       );
     } catch (err) {
+      if (!this.isCurrent(run)) return;
       this.setError({
         source: 'provision',
         code: 'provision_failed',
         message: toErrorMessage(err),
-        recoverable: true,
+        recoverable: this.transport.isConnected,
       });
       return;
     }
 
-    this.emit('provisionResult', result);
-    this.setStep('success');
-
-    // Best-effort: grab the device's assigned IP/network details over the
-    // still-open BLE link before it tears down. Never let this fail an
-    // otherwise-successful provision — waitForNetworkInfo swallows its own
-    // errors and returns null, and we keep the budget under the firmware's
-    // post-success reboot backstop (~15 s).
-    const networkInfo =
-      (await this.protocol.waitForNetworkInfo()) ?? undefined;
-
+    if (!this.isCurrent(run)) return;
     const provisionResult: ProvisioningResult = {
       success: true,
       ssid: result.ssid,
       provisionStatus: result.status,
-      deviceName: this.transport.connectedDevice?.name,
-      deviceId: this.transport.connectedDevice?.id,
-      networkInfo,
+      deviceName: target?.name,
+      deviceId: target?.id,
     };
+    this.emit('provisionResult', result);
+    // Publish the essential result before success becomes visible. Consumers
+    // may dismiss immediately; optional metadata must not delay completion.
     this.emit('provisioningComplete', provisionResult);
+    if (!this.isCurrent(run)) return;
+    this.setStep('success');
+    void this.enrichResult(provisionResult, run);
+  }
+
+  private async enrichResult(result: ProvisioningResult, run: AbortController): Promise<void> {
+    const networkInfo = await this.protocol.waitForNetworkInfo(3, 500, {
+      signal: run.signal,
+      timeoutMs: this.config.flow.networkInfoTimeoutMs,
+    });
+    if (this.isCurrent(run) && this._step === 'success' && networkInfo) {
+      this.emit('provisioningResultUpdated', { ...result, networkInfo });
+    }
   }
 
   /**
@@ -478,6 +508,11 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
    * previous attempt produced a `provision`-source error.
    */
   async retryJoin(password?: string): Promise<void> {
+    if (this._step !== 'joiningWifi' || !this._error) return;
+    if (!this.transport.isConnected) {
+      await this.goToScanning();
+      return;
+    }
     log.info('retryJoin for:', this._selectedNetwork?.ssid);
     if (!this._selectedNetwork) {
       this.setError({
@@ -494,15 +529,22 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
       this.setStep('enterCredentials');
       return;
     }
+    this.setStep('enterCredentials');
     await this.submitPassword(password);
   }
 
   /**
-   * Clear the failed selection and return to the network list. The SDK
-   * doesn't keep credentials between provision() calls, so there's
-   * nothing to undo on the device side — this is purely a UI reset.
+   * Clear a failed selection and scan again while the current session is
+   * still usable. A disconnected or timed-out session returns to device
+   * selection; firmware determines when another provisioning attempt is allowed.
    */
   async pickDifferentNetwork(): Promise<void> {
+    if (this._step !== 'joiningWifi' || !this._error) return;
+    if (!this.transport.isConnected) {
+      await this.goToScanning();
+      return;
+    }
+    this.clearError();
     log.info('pickDifferentNetwork');
     this._selectedNetwork = null;
     this.emit('selectedNetworkChanged', null);
@@ -516,29 +558,29 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
   }
 
   async cancel(): Promise<void> {
-    log.info('cancel');
+    await this.reset();
+  }
 
+  private async reset(error: ProvisioningError | null = null): Promise<void> {
+    const run = this.beginRun();
     this._step = 'welcome';
     this._selectedNetwork = null;
     this._scannedNetworks = [];
     this._device = null;
-    this._error = null;
+    this._error = error;
     this._pendingDevice = null;
     this._pendingAuth = null;
     this._forceAuthPrompt = false;
-
-    try {
-      await this.transport.disconnect();
-    } catch (err) {
-      log.warn('Disconnect during cancel failed (ignoring):', toErrorMessage(err));
+    try { await this.transport.disconnect(); } catch (err) {
+      log.warn('Disconnect during reset failed:', toErrorMessage(err));
     }
-
+    if (this.run !== run) return;
     this.emit('provisioningReset');
     this.emit('stepChanged', 'welcome');
     this.emit('selectedNetworkChanged', null);
     this.emit('scannedNetworksUpdated', []);
     this.emit('deviceConnectionChanged', null);
-    this.emit('errorChanged', null);
+    this.emit('errorChanged', error);
   }
 
   // -----------------------------------------------------------------------
@@ -546,6 +588,8 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
   // -----------------------------------------------------------------------
 
   async destroy(): Promise<void> {
+    if (this.destroyed) return;
+    this.destroyed = true;
     log.info('destroy');
     await this.cancel();
     this.unsubscribeFromServices();
@@ -556,46 +600,56 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
   // Private helpers
   // -----------------------------------------------------------------------
 
+  private beginRun(): AbortController {
+    this.run.abort();
+    this.protocol.cancelPendingOperations();
+    this.run = new AbortController();
+    return this.run;
+  }
+
+  private isCurrent(run: AbortController): boolean {
+    return !this.destroyed && this.run === run && !run.signal.aborted;
+  }
+
   private async goToScanning(): Promise<void> {
+    if (this.destroyed) return;
+    const run = this.beginRun();
     this.clearError();
     this._selectedNetwork = null;
     this._scannedNetworks = [];
     this._device = null;
+    this._pendingDevice = null;
+    this._pendingAuth = null;
+    this._forceAuthPrompt = false;
     this.emit('selectedNetworkChanged', null);
     this.emit('scannedNetworksUpdated', []);
     this.emit('deviceConnectionChanged', null);
-
-    if (this.transport.isConnected) {
-      try {
-        await this.transport.disconnect();
-        await delay(DISCONNECT_SETTLE_MS);
-      } catch (err) {
-        log.warn('Disconnect before scan failed (continuing):', toErrorMessage(err));
-      }
-    }
-
     this.setStep('scanBle');
+    const needsSettle = this.transport.connectionState !== 'disconnected';
     try {
+      await this.transport.disconnect();
+      if (needsSettle) await pause(DISCONNECT_SETTLE_MS, run.signal);
+      if (!this.isCurrent(run)) return;
       await this.transport.startScan();
-    } catch (err) {
-      this.setError({
-        source: 'ble',
-        message: toErrorMessage(err),
-        recoverable: true,
-      });
+    } catch (error) {
+      if (!this.isCurrent(run) || error instanceof OperationCancelledError) return;
+      this.setError({ source: 'ble', message: toErrorMessage(error), recoverable: true });
     }
   }
 
   private async runWifiScan(): Promise<void> {
+    const run = this.run;
     try {
       const networks = (await this.protocol.scanWifi()).sort(
         (a, b) => b.rssi - a.rssi,
       );
+      if (!this.isCurrent(run)) return;
       this._scannedNetworks = networks;
       this.emit('scannedNetworksUpdated', networks);
       this.setStep('chooseNetwork');
       log.info(`Found ${networks.length} WiFi networks`);
     } catch (err) {
+      if (!this.isCurrent(run)) return;
       this.setError({
         source: 'protocol',
         message: toErrorMessage(err),
@@ -630,15 +684,12 @@ export class ProvisioningManager extends TypedEventEmitter<ProvisioningManagerEv
       this.transport.on('connectionStateChanged', (state: BleConnectionState) => {
         if (state === 'disconnected' && !DISCONNECT_SAFE_STEPS.has(this._step)) {
           log.warn('Bluetooth connection lost during step:', this._step);
-          this._device = null;
-          this.emit('deviceConnectionChanged', null);
-          this.setError({
+          void this.reset({
             source: 'ble',
             code: 'connection_lost',
-            message: 'Bluetooth connection lost',
+            message: 'Bluetooth connection lost. Select the device again to continue.',
             recoverable: false,
           });
-          void this.cancel();
         }
       }),
     );

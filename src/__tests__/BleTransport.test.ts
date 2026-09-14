@@ -17,6 +17,7 @@ import {
   ESPTransport,
 } from '../__mocks__/esp-idf-provisioning';
 import { BleTransport } from '../services/BleTransport';
+import { setLogLevel } from '../utils/logger';
 import type {
   BleLibraryError,
   DiscoveredDevice,
@@ -49,6 +50,12 @@ async function runScan(transport: BleTransport): Promise<{
 describe('BleTransport scan', () => {
   beforeEach(() => {
     mockHooks.search = undefined;
+    jest.restoreAllMocks();
+    setLogLevel('warn');
+  });
+
+  afterEach(() => {
+    setLogLevel('warn');
     jest.restoreAllMocks();
   });
 
@@ -174,5 +181,64 @@ describe('BleTransport scan', () => {
 
     expect(discovered).toHaveLength(1);
     expect(completed?.matched).toBe(1);
+  });
+
+  it.each([
+    ['bluetooth_powered_off', 'No bluetooth device found with given prefix.', 'powered_off'],
+    ['bluetooth_unauthorized', 'No bluetooth device found with given prefix.', 'bluetooth_unauthorized'],
+    ['scan_failed', 'Bluetooth is powered off; no bluetooth device found.', 'powered_off'],
+    ['error', 'Bluetooth is disabled. No bluetooth device found.', 'powered_off'],
+    ['scan_failed', 'Bluetooth permission denied; no bluetooth device found.', 'bluetooth_unauthorized'],
+    ['error', 'Missing permissions: BLUETOOTH_SCAN. No bluetooth device found.', 'bluetooth_unauthorized'],
+  ])('preserves actionable %s errors even when the SDK also reports no devices', async (code, message, expectedCode) => {
+    mockHooks.search = () => { throw Object.assign(new Error(message), { code }); };
+    const transport = new BleTransport();
+    const { errors, completed } = await runScan(transport);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ code: expectedCode, message });
+    expect(completed).toBeNull();
+    expect(transport.connectionState).toBe('disconnected');
+    await transport.destroy();
+  });
+
+  it.each(['error', 'scan_failed'])('keeps an ordinary no-device %s response benign', async (code) => {
+    mockHooks.search = () => {
+      throw Object.assign(new Error('No bluetooth device found with given prefix.'), { code });
+    };
+    const transport = new BleTransport();
+    const { errors, completed } = await runScan(transport);
+    expect(errors).toEqual([]);
+    expect(completed?.matched).toBe(0);
+    await transport.destroy();
+  });
+
+  it('logs the native result count without logging returned device details', async () => {
+    setLogLevel('debug');
+    const debug = jest.spyOn(console, 'debug').mockImplementation(() => {});
+    mockHooks.search = () => [device('PROV_private-device-name')];
+    const transport = new BleTransport();
+    await runScan(transport);
+    expect(debug).toHaveBeenCalledWith(
+      '[esp-wifi-mgr:BleTransport]', 'Native BLE scan result', { count: 1 },
+    );
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('private-device-name');
+    await transport.destroy();
+  });
+
+  it('logs only the native error code and message before benign-error classification', async () => {
+    setLogLevel('debug');
+    const debug = jest.spyOn(console, 'debug').mockImplementation(() => {});
+    const message = 'No bluetooth device found with given prefix.';
+    mockHooks.search = () => {
+      throw Object.assign(new Error(message), { code: 'scan_failed', nativeExtra: 'do-not-log' });
+    };
+    const transport = new BleTransport();
+    const { errors } = await runScan(transport);
+    expect(errors).toEqual([]);
+    expect(debug).toHaveBeenCalledWith(
+      '[esp-wifi-mgr:BleTransport]', 'Native BLE scan rejected', { code: 'scan_failed', message },
+    );
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('do-not-log');
+    await transport.destroy();
   });
 });

@@ -131,7 +131,7 @@ type DeviceConnection =
 
 2. **Don't read multiple error fields.** There is one: `error`. Sources are tagged via `error.source`. The old `bleError` / `pollError` / `provisioningError` fields are gone.
 
-3. **Don't use `lastResult` for in-flow status.** It only fills in on `success`. While the wizard is running, read `device.name` for the device and `selectedNetwork` for the WiFi target. There is no live `wifiSsid`/`wifiIp` stream from the SDK. The device's IP arrives once, on `success`, as `lastResult.networkInfo` (read over BLE from `esp-wifi-config-network-info`, best-effort, firmware 0.2.0+); if it's absent, fetch it via mDNS or the device's HTTP API once it's on the network.
+3. **Don't use `lastResult` for in-flow status.** It fills immediately before `success`. While the wizard is running, read `device.name` for the device and `selectedNetwork` for the WiFi target. There is no live `wifiSsid`/`wifiIp` stream from the SDK. Optional device IP information can arrive afterward as `lastResult.networkInfo` (read over BLE from `esp-wifi-config-network-info`, best-effort, firmware 0.2.0+); if it's absent, fetch it via mDNS or the device's HTTP API once it's on the network.
 
 4. **Don't gate effects on a global `busy` flag.** There isn't one. Each hook (`useDeviceVariables`, `useDeviceProtocol`) tracks its own `loading` per-instance. Use that.
 
@@ -208,6 +208,7 @@ type ProvisioningConfig = {
   ble?: {
     deviceNamePrefix?: string | string[];   // default 'PROV_'
     scanTimeoutMs?: number;                  // default 10000
+    connectTimeoutMs?: number;               // default 20000, discovery + handshake
     security?: 0 | 1 | 2;                    // default 1
     proofOfPossession?: string;              // sec1 PoP / sec2 SRP password. No default: unset → wizard prompts; '' → sec1 device with no PoP
     username?: string;                       // sec2 only, default 'wificfg' (the with_ble example's value; must match the device's salt/verifier)
@@ -218,9 +219,10 @@ type ProvisioningConfig = {
     endpointTimeouts?: Record<string, number>;
   };
   flow?: {
-    onConnected?: (ctx: { protocol; transport }) => Promise<void>;
+    onConnected?: (ctx: { protocol; transport; signal: AbortSignal }) => Promise<void>;
     autoConnectOpenNetworks?: boolean;
     provisionTimeoutMs?: number;             // default 60000
+    networkInfoTimeoutMs?: number;            // default 3000, total enrichment budget
   };
 };
 ```
@@ -279,3 +281,11 @@ Pass to `<ProvisioningNavigator config={...} />` or `initializeServices(config)`
 - Don't add new step values without updating `STEP_NUMBERS`, `PROVISIONING_STEP_ORDER`, and `stepToScreenName`.
 - Don't reach into `ProvisioningManager` from screens; go through `useProvisioning()`.
 - Don't use the BLE `error` event for "no devices found". Listen to `scanCompleted` for diagnostics.
+
+## Lifecycle contract for integrations
+
+The manager aborts the `onConnected` context's `signal` and ignores old async work when the user cancels, changes device, or destroys the wizard. Custom UI callbacks must check that signal after awaits and use it to release any pending screen gate. Scan and connect deadlines settle their JS promises even if native fails to call back; timed-out protocol operations disconnect before retrying.
+
+`provisioningComplete` fires once with identity, SSID and SDK status **before** `success` is visible. Optional network info runs independently under a total 3-second default deadline; `provisioningResultUpdated` updates `lastResult` if it arrives before cancel/restart. Do not use every `lastResult` update as a completion callback. Dismissal never needs to wait for an IP address.
+
+For a custom wizard, initialize with `useProvisioningStore.getState().initialize(config)` and release with its asynchronous `destroy()`. `cancel()` keeps the services reusable and retains the last successful result. A spontaneous disconnect before joining returns to `welcome` with a preserved `connection_lost` error. Generic native `session_init_failed` allows auth re-entry without claiming a wrong PoP; Bluetooth permission errors remain distinct.

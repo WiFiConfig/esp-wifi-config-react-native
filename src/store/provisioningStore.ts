@@ -92,7 +92,7 @@ export interface ProvisioningStoreState {
 export interface ProvisioningStoreActions {
   // -- Lifecycle --
   initialize: (config?: ProvisioningConfig) => void;
-  destroy: () => void;
+  destroy: () => Promise<void>;
 
   // -- Wizard verbs --
   start: () => Promise<void>;
@@ -231,6 +231,11 @@ function subscribeToServices(set: SetState): void {
     }),
   );
   unsubscribers.push(
+    manager.on('provisioningResultUpdated', (result) => {
+      set({ lastResult: result });
+    }),
+  );
+  unsubscribers.push(
     manager.on('provisionResult', (result) => {
       set({ lastProvisionResult: result });
     }),
@@ -274,12 +279,12 @@ export const useProvisioningStore = create<
     ensureInitialized(set, config);
   },
 
-  destroy: () => {
+  destroy: async () => {
     for (const unsub of unsubscribers) unsub();
     unsubscribers = [];
     subscribedManager = null;
-    void destroyServices();
     set(initialState);
+    await destroyServices();
   },
 
   // Wizard verbs

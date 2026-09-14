@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — first integration lifecycle fixes
+
+- Cancel pending scans, connections, protocol requests, custom configuration gates and result enrichment without allowing old completions to revive the wizard.
+- Bound connection discovery/handshake (`ble.connectTimeoutMs`, 20 s default). Disconnect stalled protocol sessions before retry.
+- Publish confirmed provisioning success immediately with stable device identity; enrich optional IP details through `provisioningResultUpdated` under one total deadline (`flow.networkInfoTimeoutMs`, 3 s default).
+- Expose `onConnected` cancellation through `AbortSignal` and make store teardown awaitable.
+- Consume native iOS disconnect events and structured errors when available. Keep connection-loss messages visible; distinguish session setup failure from incorrect credentials and OS permission denial.
+- Add deferred-operation regressions for cancellation, restart, duplicate input, deadline cleanup and completion ordering.
+
+
 ## 1.0.0 — unreleased
 
 Initial release. React Native library for provisioning Wi-Fi credentials onto an ESP32 over BLE

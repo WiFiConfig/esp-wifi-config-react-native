@@ -12,6 +12,7 @@
 import { useCallback, useState } from 'react';
 
 import { useProvisioningStore } from '../store/provisioningStore';
+import { OperationCancelledError } from '../utils/operations';
 import type {
   DeviceCapabilities,
   DeviceNetworkInfo,
@@ -47,7 +48,9 @@ export function useDeviceProtocol() {
     try {
       return await promise;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (!(err instanceof OperationCancelledError)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
       throw err;
     } finally {
       setInFlight((c) => c - 1);

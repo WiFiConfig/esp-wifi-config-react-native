@@ -46,6 +46,7 @@ import {
 } from '../constants/protocol';
 
 import { TypedEventEmitter, createLogger } from '../utils';
+import { OperationCancelledError, OperationTimeoutError, pause, waitForOperation } from '../utils/operations';
 
 import type { BleTransport } from './BleTransport';
 
@@ -78,26 +79,6 @@ function authModeToString(mode: ESPWifiAuthMode | number): WifiAuthType {
   }
 }
 
-function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  label: string,
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${ms}ms`));
-    }, ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer !== null) clearTimeout(timer);
-  });
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function toMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -111,10 +92,17 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
   private readonly config: Required<Pick<DeviceProtocolConfig, 'defaultTimeoutMs'>> &
     Pick<DeviceProtocolConfig, 'endpointTimeouts'>;
   private inFlight = 0;
+  private operationController = new AbortController();
+  private destroyed = false;
+  private readonly unsubscribeConnection: () => void;
 
   constructor(transport: BleTransport, config?: DeviceProtocolConfig) {
     super();
     this.transport = transport;
+    // Starting a different native session invalidates every old request.
+    this.unsubscribeConnection = transport.on('connectionStateChanged', (state) => {
+      if (state === 'connecting') this.cancelPendingOperations();
+    });
     this.config = {
       defaultTimeoutMs: config?.defaultTimeoutMs ?? DEFAULT_ENDPOINT_TIMEOUT_MS,
       endpointTimeouts: config?.endpointTimeouts,
@@ -133,8 +121,9 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
     const device = this.requireDevice();
     this.setBusy(true);
     try {
-      const raw = await withTimeout<ESPWifiList[]>(
+      const raw = await waitForOperation<ESPWifiList[]>(
         device.scanWifiList(),
+        this.operationController.signal,
         DEFAULT_WIFI_SCAN_TIMEOUT_MS,
         'scanWifi',
       );
@@ -145,6 +134,11 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
         bssid: n.bssid,
         channel: n.channel,
       }));
+    } catch (error) {
+      // Native operations cannot safely be retried on the same session while
+      // their timed-out callback is still outstanding. Require a new session.
+      if (error instanceof OperationTimeoutError) void this.transport.disconnect();
+      throw error;
     } finally {
       this.setBusy(false);
     }
@@ -164,13 +158,19 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
     this.setBusy(true);
     try {
       const ms = timeoutMs ?? DEFAULT_PROVISION_TIMEOUT_MS;
-      const resp: { status: string } = await withTimeout(
+      const resp: { status: string } = await waitForOperation(
         device.provision(ssid, password),
+        this.operationController.signal,
         ms,
         'provision',
       );
       log.info('provision result:', resp.status);
       return { ssid, status: resp.status };
+    } catch (error) {
+      // Native operations cannot safely be retried on the same session while
+      // their timed-out callback is still outstanding. Require a new session.
+      if (error instanceof OperationTimeoutError) void this.transport.disconnect();
+      throw error;
     } finally {
       this.setBusy(false);
     }
@@ -221,28 +221,48 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
   }
 
   /**
-   * Poll {@link getNetworkInfo} until the station reports `connected: true`
-   * (IP assigned) or the attempts are exhausted. Best-effort: returns the last
-   * response even if still unconnected, and resolves `null` if every attempt
-   * threw (e.g. firmware predates the endpoint, or BLE dropped). Never throws —
-   * a missing IP must not fail an otherwise-successful provision.
-   *
-   * Keep the budget well under the firmware's post-success reboot backstop
-   * (~15 s): default 3 attempts × 1 s ≈ 2 s of waiting plus round-trips.
+   * Best-effort network details with one total deadline (default 3000 ms).
+   * Cancellation or transport loss stops retries. A missing result never
+   * turns an already-confirmed successful provision into failure.
+   * @example await protocol.waitForNetworkInfo(3, 500, { timeoutMs: 2000 });
    */
   async waitForNetworkInfo(
     attempts = 3,
-    intervalMs = 1000,
+    intervalMs = 500,
+    options: { timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<DeviceNetworkInfo | null> {
+    const deadline = Date.now() + (options.timeoutMs ?? 3000);
+    const session = this.operationController.signal;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    session.addEventListener('abort', abort);
+    options.signal?.addEventListener('abort', abort);
+    if (session.aborted || options.signal?.aborted) controller.abort();
     let last: DeviceNetworkInfo | null = null;
-    for (let i = 0; i < attempts; i++) {
-      try {
-        last = await this.getNetworkInfo();
-        if (last.connected) return last;
-      } catch (err) {
-        log.warn('network-info attempt failed:', toMessage(err));
+    try {
+      for (let i = 0; i < attempts; i++) {
+        if (controller.signal.aborted || !this.transport.isConnected || Date.now() >= deadline) break;
+        try {
+          last = await this.sendJson<DeviceNetworkInfo>(PROV_ENDPOINT_NETWORK_INFO, undefined, {
+            signal: controller.signal,
+            timeoutMs: Math.max(0, deadline - Date.now()),
+          });
+          if (last.connected) return last;
+        } catch (error) {
+          // A timed-out native request can still own the response callback.
+          // Do not overlap it with another optional request on this session.
+          if (error instanceof OperationCancelledError || error instanceof OperationTimeoutError || !this.transport.isConnected) break;
+          log.debug('Optional network info unavailable:', toMessage(error));
+        }
+        if (i < attempts - 1 && Date.now() < deadline) {
+          await pause(Math.min(intervalMs, deadline - Date.now()), controller.signal);
+        }
       }
-      if (i < attempts - 1) await delay(intervalMs);
+    } catch (error) {
+      if (!(error instanceof OperationCancelledError)) log.debug('Network info stopped:', toMessage(error));
+    } finally {
+      session.removeEventListener('abort', abort);
+      options.signal?.removeEventListener('abort', abort);
     }
     return last;
   }
@@ -288,7 +308,16 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
   // Lifecycle
   // ---------------------------------------------------------------------------
 
+  /** Cancel current requests without disposing the reusable protocol instance. */
+  cancelPendingOperations(): void {
+    this.operationController.abort();
+    this.operationController = new AbortController();
+  }
+
   destroy(): void {
+    this.destroyed = true;
+    this.unsubscribeConnection();
+    this.cancelPendingOperations();
     this.removeAllListeners();
   }
 
@@ -297,6 +326,7 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
   // ---------------------------------------------------------------------------
 
   private requireDevice() {
+    if (this.destroyed) throw new OperationCancelledError();
     const device = this.transport.espDevice;
     if (!device) {
       throw new Error('No device connected');
@@ -327,9 +357,10 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
   private async sendJson<TRes>(
     endpoint: string,
     body: unknown,
+    options?: { signal: AbortSignal; timeoutMs: number },
   ): Promise<TRes> {
     const device = this.requireDevice();
-    const ms = this.resolveTimeout(endpoint);
+    const ms = Math.min(this.resolveTimeout(endpoint), options?.timeoutMs ?? Infinity);
     // IMPORTANT: never send a zero-length payload. The ESP32 protocomm BLE
     // transport does not dispatch an empty write to its endpoint handler, so
     // the device produces no response and the read returns empty (the call
@@ -348,8 +379,9 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
 
     this.setBusy(true);
     try {
-      const responseStr: string = await withTimeout(
+      const responseStr: string = await waitForOperation(
         device.sendData(endpoint, requestStr),
+        options?.signal ?? this.operationController.signal,
         ms,
         endpoint,
       );
@@ -376,7 +408,9 @@ export class DeviceProtocol extends TypedEventEmitter<DeviceProtocolEvents> {
       }
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
-      log.warn(`Endpoint ${endpoint} failed:`, error.message);
+      if (err instanceof OperationCancelledError) throw err;
+      if (err instanceof OperationTimeoutError && !options) void this.transport.disconnect();
+      log.debug(`Endpoint ${endpoint} failed:`, error.message);
       this.emit('endpointError', error, endpoint);
       throw error;
     } finally {

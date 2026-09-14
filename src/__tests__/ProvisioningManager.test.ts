@@ -24,7 +24,7 @@ describe('ProvisioningManager (SDK-backed)', () => {
     mockHooks.connect = undefined;
     mockHooks.scanWifi = undefined;
     mockHooks.provision = undefined;
-    mockHooks.sendData = undefined;
+    mockHooks.sendData = () => JSON.stringify({ connected: true });
   });
 
   it('walks happy-path: start → device → wifi → submit → success', async () => {
@@ -381,6 +381,7 @@ describe('ProvisioningManager (SDK-backed)', () => {
 
     const completed: unknown[] = [];
     manager.on('provisioningComplete', (r) => completed.push(r));
+    const enrichment = new Promise<unknown>((resolve) => manager.on('provisioningResultUpdated', resolve));
 
     await manager.start();
     await manager.chooseDevice({ id: 'PROV_NI', name: 'PROV_NI', rssi: null });
@@ -389,9 +390,11 @@ describe('ProvisioningManager (SDK-backed)', () => {
 
     expect(manager.currentStep).toBe('success');
     expect(infoPaths.every((p) => p === 'esp-wifi-config-network-info')).toBe(true);
+    const enriched = await enrichment;
     expect(calls).toBe(2); // stopped polling as soon as connected:true arrived
     expect(completed).toHaveLength(1);
-    expect(completed[0]).toMatchObject({
+    expect(completed[0]).not.toHaveProperty('networkInfo');
+    expect(enriched).toMatchObject({
       success: true,
       ssid: 'Home',
       provisionStatus: 'success',
@@ -428,6 +431,7 @@ describe('ProvisioningManager (SDK-backed)', () => {
     expect(manager.error).toBeNull();
     expect(completed).toHaveLength(1);
     expect(completed[0].networkInfo).toBeUndefined();
+    await manager.cancel();
   });
 
   // -------------------------------------------------------------------------

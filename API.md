@@ -141,7 +141,7 @@ await transport.destroy();
 Events: `connectionStateChanged`, `deviceDiscovered`, `scanCompleted`, `scanStopped`, `error`.
 
 Notable methods:
-- `startScan(): Promise<void>` — runs one `searchESPDevices()` per configured prefix and emits one `deviceDiscovered` per match.
+- `startScan(): Promise<void>` — runs one match-all `searchESPDevices()` call, filters all configured prefixes, and emits one `deviceDiscovered` per match.
 - `stopScan(): void` — cancels an in-flight scan.
 - `connect(deviceId, overrides?: { pop?, username? }): Promise<ConnectedDeviceInfo>` — establishes the BLE link plus protocomm session.
 - `disconnect(): Promise<void>` — clean teardown.
@@ -160,9 +160,9 @@ const v = await protocol.getVersion();
 await protocol.setVar('mdns_name', 'demo');
 ```
 
-Methods: `scanWifi`, `provision`, `getVersion`, `getCapabilities`, `getNetworkPolicy`, `getNetworkInfo`, `waitForNetworkInfo(attempts = 3, intervalMs = 1000)`, `listVars`, `getVar`, `setVar`, `delVar`, `destroy`. Emits `busyChanged` and `endpointError`.
+Methods: `scanWifi`, `provision`, `getVersion`, `getCapabilities`, `getNetworkPolicy`, `getNetworkInfo`, `waitForNetworkInfo(attempts = 3, intervalMs = 500, options?: { timeoutMs?: number; signal?: AbortSignal })`, `listVars`, `getVar`, `setVar`, `delVar`, `cancelPendingOperations`, `destroy`. Emits `busyChanged` and `endpointError`.
 
-`getNetworkInfo()` reads `esp-wifi-config-network-info` once and may return `{ connected: false }` before the device has an IP. `waitForNetworkInfo()` polls it until `connected` is true or the attempts run out; it never throws and resolves `null` if every attempt failed (firmware < 0.2.0, or BLE already dropped). Keep the total budget well inside the firmware's ~15 s post-success reboot backstop.
+`getNetworkInfo()` reads `esp-wifi-config-network-info` once and may return `{ connected: false }` before the device has an IP. `waitForNetworkInfo()` polls it until `connected` is true or the attempts run out; it never throws and resolves `null` if every attempt failed (firmware < 0.2.0, or BLE already dropped). One deadline includes every request and retry delay (`timeoutMs`, default 3000 ms). Cancellation and BLE loss stop further retries. Native scan/provision/custom-command timeouts disconnect the stalled session before another attempt; optional network-info expiration does not fail the successful result.
 
 ### `ProvisioningManager`
 
@@ -171,7 +171,8 @@ Layer 3. Wizard state machine. Used internally by the store; useful for headless
 ```ts
 const manager = new ProvisioningManager(transport, protocol, config);
 manager.on('stepChanged', step => { /* ... */ });
-manager.on('provisioningComplete', result => { /* ... */ });
+manager.on('provisioningComplete', result => { /* confirmed success, exactly once */ });
+manager.on('provisioningResultUpdated', result => { /* optional networkInfo enrichment */ });
 await manager.start();
 await manager.chooseDevice({ id, name, rssi });
 // If sec1/2 with promptForAuth: true or missing credentials:
@@ -181,6 +182,8 @@ await manager.submitPassword(password);
 ```
 
 Public methods: `start`, `chooseDevice`, `submitDeviceAuth`, `proceedFromConfigure`, `rescanWifi`, `chooseNetwork`, `backToNetworks`, `submitPassword`, `retryJoin`, `pickDifferentNetwork`, `pickDifferentDevice`, `cancel`, `destroy`. Getters: `currentStep`, `selectedNetwork`, `scannedNetworks`, `device`, `error`, `pendingAuth`.
+
+`provisioningComplete` is emitted with stable device identity and SSID before entering `success`. `submitPassword()` resolves without waiting for optional details. The store publishes this initial result immediately, then updates `lastResult` when `provisioningResultUpdated` arrives. Cancellation/restart suppresses stale results and aborts `onConnected`'s `signal`. Consumers should not treat an update to `lastResult` as a new completion.
 
 ## Service factory (singleton access)
 
@@ -305,6 +308,7 @@ type ProvisioningConfig = {
     onConnected?: (ctx: OnConnectedContext) => Promise<void>;
     autoConnectOpenNetworks?: boolean;     // default true
     provisionTimeoutMs?: number;           // default 60_000
+    networkInfoTimeoutMs?: number;          // default 3_000, total enrichment budget
   };
 };
 ```
@@ -315,6 +319,7 @@ type ProvisioningConfig = {
 type BleTransportConfig = {
   deviceNamePrefix?: string | string[];   // default 'PROV_'
   scanTimeoutMs?: number;                  // default 10_000
+  connectTimeoutMs?: number;               // default 20_000, includes discovery + handshake
   security?: 0 | 1 | 2;                    // default 1
   proofOfPossession?: string;              // sec1 PoP / sec2 SRP password — no default, see below
   username?: string;                       // sec2 only, default 'wificfg'
@@ -442,3 +447,21 @@ type ScreenName = (typeof SCREEN_NAMES)[keyof typeof SCREEN_NAMES];
 ```
 
 Screen names: `Welcome`, `Connect`, `DeviceAuth`, `Configure`, `NetworkScan`, `Credentials`, `Joining`, `Success`.
+
+## Screen lifecycle and cancellation
+
+Use `useProvisioningStore.getState().initialize(config)` when the custom wizard mounts and `await useProvisioningStore.getState().destroy()` when it is permanently released. `cancel()` resets the current run and preserves the last successful result; it can be reused for another device. `destroy()` removes subscriptions and resets the store, and is safe to call again. A replacement session cannot receive callbacks from the discarded run.
+
+`OnConnectedContext` includes a required `signal: AbortSignal`. Register abort cleanup for a custom screen gate and check `signal.aborted` after awaited reads before updating that screen. The manager stops awaiting the callback as soon as the run is cancelled, even when application code ignores the signal.
+
+```ts
+flow: {
+  onConnected: async ({ protocol, signal }) => {
+    const name = await protocol.getVar('mdns_name');
+    if (signal.aborted) return;
+    await showHostnameEditor(name?.value ?? '', signal);
+  },
+}
+```
+
+The native wrapper's optional `addDeviceDisconnectListener` is used when available. Its iOS `bluetooth_unauthorized`, `bluetooth_powered_off`, `connect_timeout`, and `session_init_failed` codes remain distinguishable in the library error model. `session_init_failed` allows authentication re-entry with a generic explanation; it does not assert that credentials were incorrect. Bluetooth permission failures do not open the device authentication screen. Android wrappers without per-device disconnect events still detect failure through command errors and bounded timeouts.
